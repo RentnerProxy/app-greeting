@@ -1,7 +1,7 @@
 {
     "formatVersion": 1,
     "id": "rentnerproxy.greeting",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "display": {
         "name": "Greeting",
         "summary": "Save a greeting in this RentnerProxy installation.",
