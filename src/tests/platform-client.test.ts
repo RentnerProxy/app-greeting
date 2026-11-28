@@ -264,36 +264,49 @@ async function withRawCore(
     }
 }
 
-linuxTest('A repeatable call is repeated when its response is lost while it arrives', () => {
-    const context = parseProtocolDocument('PlatformContext', {
-        appId: app.id,
-        installationId,
-        generation: 1,
-        runtimeProfile: app.requires.runtimeProfile,
-        versions: { appProtocol: '1.0.0', platformApi: '1.0.0', uiBridge: '1.0.0' },
-        capabilities: grants,
-    })
-    return withRawCore(
-        (_request, attempt) => {
-            if (attempt > 1) return Response.json(context)
-            // The connection breaks after the first bytes of the body: the stream is only errored
-            // on a later pull, once the client has read the first chunk. Erroring it right after
-            // the enqueue would discard the chunk before anything is sent.
-            let pulls = 0
-            const body = new ReadableStream<Uint8Array>({
-                pull(controller) {
-                    pulls += 1
-                    if (pulls === 1) controller.enqueue(new TextEncoder().encode('{"appId":'))
-                    else controller.error(new Error('connection lost'))
-                },
-            })
-            return new Response(body, { headers: { 'Content-Type': 'application/json' } })
-        },
-        async (client, attempts) => {
-            expect(await client.call('getPlatformContext')).toMatchObject({ installationId })
-            expect(attempts()).toBe(2)
-        },
+linuxTest('A repeatable call is repeated when its response is lost while it arrives', async () => {
+    const context = JSON.stringify(
+        parseProtocolDocument('PlatformContext', {
+            appId: app.id,
+            installationId,
+            generation: 1,
+            runtimeProfile: app.requires.runtimeProfile,
+            versions: { appProtocol: '1.0.0', platformApi: '1.0.0', uiBridge: '1.0.0' },
+            capabilities: grants,
+        }),
     )
+    const head = `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ${Buffer.byteLength(context)}\r\n\r\n`
+    const directory = await mkdtemp('/tmp/rentnerproxy-raw-core-')
+    const socket = join(directory, 'core.sock')
+    const answered = new Set<unknown>()
+    let attempts = 0
+    // A raw server, because a response stream that errors surfaces as an uncaught error in the
+    // server. Here the connection ends after the first bytes of the body, as a real one would.
+    const server = Bun.listen({
+        unix: socket,
+        socket: {
+            data(connection) {
+                if (answered.has(connection)) return
+                answered.add(connection)
+                attempts += 1
+                connection.write(attempts === 1 ? head + context.slice(0, 9) : head + context)
+                connection.end()
+            },
+        },
+    })
+    try {
+        const client = createPlatformClient({
+            coreSocket: socket,
+            coreAuthorization: 'Bearer ' + 'a'.repeat(43),
+            installationId,
+            generation: 1,
+        })
+        expect(await client.call('getPlatformContext')).toMatchObject({ installationId })
+        expect(attempts).toBe(2)
+    } finally {
+        server.stop(true)
+        await rm(directory, { recursive: true, force: true })
+    }
 })
 
 linuxTest('An oversized event never reaches the app and is not fetched again forever', () => {
@@ -500,4 +513,82 @@ linuxTest('Event lines end with CR, LF or CRLF, however the chunks split', async
             },
         )
     }
+})
+
+/** A body that stays open: the test sends chunks when it wants and closes it at the end. */
+function openStream() {
+    const encoder = new TextEncoder()
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined
+    const stream = new ReadableStream<Uint8Array>({
+        start(started) {
+            controller = started
+        },
+    })
+    return {
+        stream,
+        send: (chunk: string) => controller?.enqueue(encoder.encode(chunk)),
+        close: () => controller?.close(),
+    }
+}
+
+linuxTest('Events are delivered on an open stream without waiting for more bytes', async () => {
+    const body = openStream()
+    await withRawCore(
+        () => new Response(body.stream, { headers: eventStream }),
+        async (client) => {
+            const controller = new AbortController()
+            const delivered: string[] = []
+            const waiters: (() => void)[] = []
+            const next = async (count: number) => {
+                const deadline = Date.now() + 2_000
+                while (delivered.length < count && Date.now() < deadline) {
+                    await new Promise<void>((resolve) => {
+                        waiters.push(resolve)
+                        setTimeout(resolve, 50)
+                    })
+                }
+            }
+            const following = followPlatformEvents(client, {
+                signal: AbortSignal.any([controller.signal, AbortSignal.timeout(8_000)]),
+                onEvent: (event) => {
+                    delivered.push(event.cursor)
+                    for (const wake of waiters.splice(0)) wake()
+                },
+                onResync: () => undefined,
+            })
+            try {
+                // A CR-only event ends with a CR that no LF follows: it is complete at once.
+                body.send(eventFrame('cursor-1').replaceAll('\n', '\r'))
+                await next(1)
+                expect(delivered).toStrictEqual(['cursor-1'])
+
+                // One event whose data lines are joined: an extra blank line would split it into
+                // two invalid halves. The CRLF is split after each CR, so each LF comes later.
+                const json = JSON.stringify({
+                    id: randomUUID(),
+                    cursor: 'cursor-2',
+                    type: 'appNotificationPublished',
+                    occurredAt: new Date().toISOString(),
+                    resourceId: installationId,
+                    payload: notification,
+                })
+                const split = json.indexOf(',') + 1
+                for (const chunk of [
+                    `data: ${json.slice(0, split)}\r`,
+                    `\ndata: ${json.slice(split)}\r`,
+                    '\n\r',
+                    '\n',
+                ]) {
+                    body.send(chunk)
+                    await Bun.sleep(30)
+                }
+                await next(2)
+                expect(delivered).toStrictEqual(['cursor-1', 'cursor-2'])
+            } finally {
+                controller.abort()
+                body.close()
+            }
+            await following
+        },
+    )
 })

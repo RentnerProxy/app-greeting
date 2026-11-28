@@ -139,7 +139,9 @@ try {
             await failure.getByRole('button', { name: 'Reload app' }).click()
             await expect(failure).toBeHidden()
             await expect(page.locator('body')).toHaveAttribute('data-generation', '4')
-            await expect(frame.getByRole('heading', { name: 'Greeting' })).toBeVisible()
+            // The reloaded frame renders English first, so wait for the retained German context.
+            await expect(frame.locator('html')).toHaveAttribute('lang', 'de')
+            await expect(frame.getByRole('heading', { name: 'Gruß' })).toBeVisible()
             await expect(frame.locator('html')).toHaveAttribute('data-theme', 'light')
             equal(external.length, 0, 'The packaged UI made an external request')
             equal(errors.length, 0, errors.join('\n'))

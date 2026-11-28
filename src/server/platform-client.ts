@@ -231,6 +231,7 @@ async function* serverSentData(stream: ReadableStream<Uint8Array>) {
     // Room for a field name such as `data: ` and a trailing carriage return on one line.
     const lineLimit = limit + 16
     let pending = ''
+    let skipLf = false
     let data: string[] = []
     let size = 0
     const oversized = () => new PlatformEventError('A platform event exceeds the size limit')
@@ -261,20 +262,24 @@ async function* serverSentData(stream: ReadableStream<Uint8Array>) {
         }
     }
     for await (const chunk of stream) {
-        // Lines end with CR, LF or CRLF. A CR that ends the chunk may be half of a CRLF, so it waits.
-        const text = pending + decode(chunk)
-        const held = text.endsWith('\r') ? '\r' : ''
-        const lines = text.slice(0, text.length - held.length).split(/\r\n|\r|\n/u)
-        pending = (lines.pop() ?? '') + held
+        // Lines end with CR, LF or CRLF. A CR ends its line at once, so an event is not held back
+        // on an idle stream; the LF that may follow it, even in the next chunk, is skipped.
+        const decoded = decode(chunk)
+        let text = pending + decoded
+        if (skipLf && decoded !== '') {
+            if (text.startsWith('\n')) text = text.slice(1)
+            skipLf = false
+        }
+        const lines = text.split(/\r\n|\r|\n/u)
+        pending = lines.pop() ?? ''
+        if (text.endsWith('\r')) skipLf = true
         yield* dispatch(lines)
         // An incomplete line counts as it will once complete, so chunk boundaries do not matter.
         if (Buffer.byteLength(pending) > lineLimit) throw oversized()
-        if (size + dataBytes(pending.replace(/\r$/u, '')) > limit) throw oversized()
+        if (size + dataBytes(pending) > limit) throw oversized()
     }
     // A stream that ends inside a UTF-8 sequence carries an undecodable event.
     decode()
-    // A CR that ends the stream ends its line, as no LF can follow it.
-    if (pending.endsWith('\r')) yield* dispatch([pending.slice(0, -1)])
 }
 
 interface FollowOptions {
