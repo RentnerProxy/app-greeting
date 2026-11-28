@@ -1,6 +1,6 @@
 {
     "openapi": "3.1.0",
-    "info": { "title": "Greeting", "version": "1.0.1" },
+    "info": { "title": "Greeting", "version": "1.1.0" },
     "security": [{ "AppCredential": [] }],
     "x-rentnerproxy-ui": {
         "routes": ["overview", "details"],
